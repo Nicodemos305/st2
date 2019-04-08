@@ -1126,7 +1126,8 @@ def update_execution_records(wf_ex_db, conductor, update_lv_ac_on_statuses=None,
 
 
 @retrying.retry(retry_on_exception=wf_exc.retry_on_exceptions)
-def request_rerun(wf_ex_id, st2_ctx):
+def request_rerun(wf_ex_id, st2_ctx, wf_def, wf_ac_ex):
+    LOG.info('[%s] Processing rerun workflow execution request for workflow.', wf_ac_ex.id)
     wf_ex_db = wf_db_access.WorkflowExecution.get_by_id(str(wf_ex_id))
 
     if not wf_ex_db:
@@ -1136,24 +1137,42 @@ def request_rerun(wf_ex_id, st2_ctx):
         raise wf_exc.WorkflowExecutionIsCompletedException(str(wf_ex_db.id))
 
     if wf_ex_db.status in statuses.RUNNING_STATUSES:
-        msg = '[%s] Workflow execution "%s" is not re-runnable because it is already active.'
+        msg = '[%s] Workflow execution "%s" is not re-runnable because it is already.'
         LOG.info(msg, wf_ex_db.action_execution, str(wf_ex_db.id))
         return
 
-    LOG.info('[%s] Requesting conductor to start re-running workflow execution [%s].',
-             wf_ex_db.action_execution, wf_ex_db)
+    # Instantiate the workflow conductor.
+    # Load workflow definition into workflow spec model.
+    spec_module = specs_loader.get_spec_module('native')
+    wf_spec = spec_module.instantiate(wf_def)
 
-    conductor = deserialize_conductor(wf_ex_db)
-    conductor.request_workflow_status(statuses.RERUNNING)
+    conductor_params = {'inputs': wf_ac_ex.parameters, 'context': st2_ctx}
+    conductor = conducting.WorkflowConductor(wf_spec, **conductor_params)
 
-    # Write the updated workflow status and task flow to the database.
-    wf_ex_db.status = conductor.get_workflow_status()
-    wf_ex_db.state = conductor.workflow_state.serialize()
+    # Serialize the conductor which initializes some internal values.
+    data = conductor.serialize()
+
+    # Update workflow execution DB
+    wf_ex_db.spec = data['spec']
+    wf_ex_db.graph = data['graph']
+    wf_ex_db.state = data['state']
+    wf_ex_db.status = data['state']['status']
+    wf_ex_db.errors = data['errors']
 
     wf_ex_db.context = st2_ctx
     wf_ex_db.action_execution = st2_ctx['st2']['action_execution_id']
-    wf_db_access.WorkflowExecution.update(wf_ex_db, publish=False)
-    wf_ex_db = wf_db_access.WorkflowExecution.get_by_id(str(wf_ex_db.id))
+    wf_ex_db = wf_db_access.WorkflowExecution.update(wf_ex_db, publish=False)
+
+    conductor.request_workflow_status(statuses.REQUESTED)
+    data = conductor.serialize()
+    wf_ex_db.state = data['state']
+    wf_ex_db.status = data['state']['status']
+
+    # Put the ID of the workflow execution record in the context.
+    wf_ex_db.state['contexts'][0]['st2']['workflow_execution_id'] = str(wf_ex_db.id)
+
+    # Update the workflow execution record.
+    wf_ex_db = wf_db_access.WorkflowExecution.update(wf_ex_db, publish=False)
 
     LOG.info('[%s] Completed processing rerun request for workflow [%s].',
              wf_ex_db.action_execution, wf_ex_db)
@@ -1161,84 +1180,144 @@ def request_rerun(wf_ex_id, st2_ctx):
     return wf_ex_db
 
 
-@retrying.retry(retry_on_exception=wf_exc.retry_on_exceptions)
-def rerun_task(task_ex_id, st2_ctx, reset=False):
-    task_ex_db = wf_db_access.TaskExecution.get_by_id(task_ex_id)
-    task_ex_db.context['st2'] = st2_ctx['st2']
-    wf_ex_db = wf_db_access.WorkflowExecution.get_by_id(task_ex_db.workflow_execution)
+def rerun_task(wf_ex_db, st2_ctx, rerun_tasks):
+    # Refresh records.
+    conductor, wf_ex_db = refresh_conductor(str(wf_ex_db.id))
+    wf_ac_ex_id = wf_ex_db.action_execution
 
-    if wf_ex_db.state == statuses.PAUSED:
+    # If workflow is in requested status, set it to running.
+    if conductor.get_workflow_status() in [statuses.REQUESTED, statuses.SCHEDULED]:
+        LOG.info('[%s] Requesting conductor to start re-running workflow execution.', wf_ac_ex_id)
+        conductor.request_workflow_status(statuses.RUNNING)
+
+    # If workflow execution is no longer active, then stop processing here.
+    if wf_ex_db.status in statuses.COMPLETED_STATUSES:
+        msg = '[%s] Workflow execution is in completed status "%s".'
+        LOG.info(msg, wf_ac_ex_id, wf_ex_db.status)
         return
 
-    ac_ex_db = ex_db_access.ActionExecution.get_by_id(wf_ex_db.action_execution)
+    next_tasks = conductor.get_next_tasks()
+    # If there is no new tasks, update execution records to handle possible completion.
+    if not next_tasks:
+        # Update workflow execution and related liveaction and action execution.
+        LOG.info('[%s] No tasks identified to execute next.', wf_ac_ex_id)
+        update_execution_records(wf_ex_db, conductor)
 
-    msg = '[%s] Handling rerun of task execution "%s" for task "%s", route "%s".'
-    LOG.info(msg, wf_ex_db.action_execution, str(ac_ex_db.id),
-             task_ex_db.task_id, str(task_ex_db.task_route))
+    task_ex_dbs = wf_db_access.TaskExecution.query(workflow_execution=str(wf_ex_db.id))
 
-    #conductor, wf_ex_db = refresh_conductor(wf_ex_db.id)
-    #ac_ex_event = events.ActionExecutionEvent(statuses.RERUNNING)
-    #conductor.update_task_state(task_ex_db['id'], None, ac_ex_event)
+    # Iterate while there are next tasks identified for processing. In the case for
+    # task with no action execution defined, the task execution will complete
+    # immediately with a new set of tasks available.
+    while next_tasks:
+        msg = '[%s] Identified the following set of tasks to execute next: %s'
+        tasks_list = ', '.join(["%s (route %s)" % (t['id'], str(t['route'])) for t in next_tasks])
+        LOG.info(msg, wf_ac_ex_id, tasks_list)
 
-    # Update workflow execution and related liveaction and action execution.
-    #update_execution_records(wf_ex_db, conductor)
+        for task in next_tasks:
+            need_rerun, task_ex_db = get_task_execution_db(
+                task_ex_dbs, task['id'], wf_ex_db.id, st2_ctx, rerun_tasks)
+            if need_rerun and task_ex_db:
+                if task['spec'].has_items() and 'items_count' in task and task['items_count'] == 0:
+                    # Fast forward task execution to completion.
+                    ac_ex_event = events.ActionExecutionEvent(statuses.RUNNING)
+                    conductor.update_task_state(task['id'], task['route'], ac_ex_event)
 
-    # Update task execution to running.
-    rerun_task_execution(task_ex_db, wf_ex_db, reset)
+                    # Set the task execution to running.
+                    task_ex_db.status = statuses.RUNNING
+                    task_ex_db = wf_db_access.TaskExecution.update(task_ex_db, publish=False)
 
-    # Update workflow execution to running.
-    rerun_workflow_execution(wf_ex_db.id, task_ex_id, reset)
+                    update_task_execution(str(task_ex_db.id), statuses.SUCCEEDED)
+                    update_task_state(str(task_ex_db.id), statuses.SUCCEEDED, publish=False)
+
+                if task['spec'].action is None:
+                    msg = '[%s] Task "%s", route "%s", is action less and succeed by default.'
+                    LOG.info(msg, wf_ac_ex_id, task.task_id, str(task.task_route))
+
+                    # Set the task execution to running.
+                    task_ex_db.status = statuses.RUNNING
+                    task_ex_db = wf_db_access.TaskExecution.update(task_ex_db, publish=False)
+
+                    # Fast forward task execution to completion.
+                    update_task_execution(str(task_ex_db.id), statuses.SUCCEEDED)
+                    update_task_state(str(task_ex_db.id), statuses.SUCCEEDED, publish=False)
+
+                update_execution_records(wf_ex_db, conductor)
+
+                # If workflow execution is no longer active, then stop processing here.
+                if wf_ex_db.status in statuses.COMPLETED_STATUSES:
+                    msg = '[%s] Workflow execution is in completed status "%s".'
+                    LOG.info(msg, wf_ac_ex_id, wf_ex_db.status)
+                    break
+
+                try:
+                    msg = '[%s]  Requesting execution for task "%s", route "%s".'
+                    LOG.info(msg, wf_ac_ex_id, task['id'], str(task['route']))
+
+                    # Pass down appropriate st2 context to the task and action execution(s).
+                    root_st2_ctx = wf_ex_db.context.get('st2', {})
+                    st2_ctx = {'execution_id': wf_ac_ex_id, 'user': root_st2_ctx.get('user'),
+                               'pack': root_st2_ctx.get('pack')}
+                    if root_st2_ctx.get('api_user'):
+                        st2_ctx['api_user'] = root_st2_ctx.get('api_user')
+
+                    # If task contains multiple action execution (i.e. with items),
+                    # then mark each item individually.
+                    for action in task['actions']:
+                        ac_ex_ctx = None
+
+                        if 'item_id' in action and action['item_id'] is not None:
+                            msg = '[%s] Mark task "%s", route "%s", item "%s" in conductor as ' \
+                                  'running.'
+                            LOG.info(msg, wf_ac_ex_id, task['id'], str(task['route']),
+                                     action['item_id'])
+                            ac_ex_ctx = {'item_id': action['item_id']} if 'item_id' in action \
+                                else None
+
+                        ac_ex_event = events.ActionExecutionEvent(statuses.RUNNING,
+                                                                  context=ac_ex_ctx)
+                        conductor.update_task_state(task['id'], task['route'], ac_ex_event)
+                        ac_ex_delay = eval_action_execution_delay(task, action, task_ex_db.itemized)
+                        request_action_execution(wf_ex_db, task_ex_db, st2_ctx, action,
+                                                 delay=ac_ex_delay)
+                        task_ex_db = wf_db_access.TaskExecution.get_by_id(str(task_ex_db.id))
+                except Exception as e:
+                    msg = '[%s] Failed task execution for task "%s", route "%s".'
+                    LOG.exception(msg, wf_ac_ex_id, task['id'], str(task['route']))
+                    fail_workflow_execution(str(wf_ex_db.id), e, task=task)
+                    return
+            elif task_ex_db:
+                ac_ex_event = events.ActionExecutionEvent(statuses.RUNNING)
+                conductor.update_task_state(task['id'], task['route'], ac_ex_event)
+
+                # Fast forward task execution to completion.
+                update_task_execution(str(task_ex_db.id), statuses.SUCCEEDED)
+                update_task_state(str(task_ex_db.id), statuses.SUCCEEDED, publish=False)
+
+        conductor, wf_ex_db = refresh_conductor(str(wf_ex_db.id))
+        next_tasks = conductor.get_next_tasks()
+        if not next_tasks:
+            LOG.info('[%s] No tasks identified to execute next.', wf_ac_ex_id)
+
+        return
 
 
-@retrying.retry(retry_on_exception=wf_exc.retry_on_exceptions)
-def rerun_task_execution(task_ex_db, wf_ex_db, reset=False):
-    # Update task execution to running.
-    msg = '[%s] Updating task execution from status "%s" to "%s".'
-    LOG.debug(msg, wf_ex_db.action_execution, task_ex_db.status, statuses.RUNNING)
+def get_task_execution_db(task_ex_dbs, task_id, wf_ac_ex_id, st2_ctx, rerun_tasks):
+    need_rerun = False
+    task_ex_db = None
 
-    # Set the task execution to running.
-    task_ex_db.status = statuses.RUNNING
-    task_ex_db = wf_db_access.TaskExecution.update(task_ex_db, publish=False)
+    for task in task_ex_dbs:
+        if task.task_id == task_id:
+            if task.task_id in rerun_tasks and task.status == ac_const.LIVEACTION_STATUS_FAILED:
+                task.context['st2'] = st2_ctx['st2']
+                task.status = statuses.RUNNING
+                task.result = {}
+                task.context['st2']['action_execution_id'] = wf_ac_ex_id
+                task_ex_db = wf_db_access.TaskExecution.update(task, publish=False)
+                need_rerun = True
+                break
+            else:
+                task_ex_db = task
 
-    # Request action execution for each actions in the task request.
-    # Instantiate the live action record.
-    existing_ac_ex_db = ex_db_access.ActionExecution.query(task_execution=str(task_ex_db.id))[0]
-    action_ref = existing_ac_ex_db.liveaction['action']
-    context = existing_ac_ex_db.context
-    parameters = existing_ac_ex_db.parameters
+            break
 
-    lv_ac_db = lv_db_models.LiveActionDB(
-        action=action_ref,
-        workflow_execution=str(wf_ex_db.id),
-        task_execution=str(task_ex_db.id),
-        context=context,
-        parameters=parameters
-    )
-
-    # Set notification if instructed.
-    if (wf_ex_db.notify and wf_ex_db.notify.get('config') and
-            wf_ex_db.notify.get('tasks') and task_ex_db.task_name in wf_ex_db.notify['tasks']):
-        lv_ac_db.notify = notify_api_models.NotificationsHelper.to_model(wf_ex_db.notify['config'])
-
-    # Request action execution.
-    lv_ac_db, ac_ex_db = ac_svc.request(lv_ac_db)
-    msg = '[%s] Action execution "%s" requested for task "%s", route "%s".'
-    LOG.info(msg, wf_ex_db.action_execution, str(ac_ex_db.id), task_ex_db.task_id,
-             (task_ex_db.task_route))
-
-    return lv_ac_db, ac_ex_db
-
-
-retrying.retry(retry_on_exception=wf_exc.retry_on_exceptions)
-def rerun_workflow_execution(wf_ex_id, task_ex_id, reset=False):
-    # Update workflow execution to running.
-    conductor, wf_ex_db = refresh_conductor(wf_ex_id)
-    conductor.request_workflow_status(statuses.RUNNING)
-
-    # Update task execution in task flow to running.
-    task_ex_db = wf_db_access.TaskExecution.get_by_id(task_ex_id)
-    ac_ex_event = events.ActionExecutionEvent(statuses.RUNNING)
-    conductor.update_task_state(task_ex_db.task_id, task_ex_db.task_route, ac_ex_event)
-
-    # Update workflow execution and related liveaction and action execution.
-    update_execution_records(wf_ex_db, conductor)
+    return need_rerun, task_ex_db

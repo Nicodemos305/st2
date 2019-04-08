@@ -88,16 +88,11 @@ class OrquestaRunner(runners.AsyncActionRunner):
 
     def run(self, action_parameters):
         rerun_options = self._get_rerun_options()
+        tasks = rerun_options.get('tasks', None)
+        rerun = self.rerun_ex_ref and tasks
 
-        tasks_to_reset = rerun_options.get('reset', [])
-        task_specs = {
-            task_name: {'reset': task_name in tasks_to_reset}
-            for task_name in rerun_options.get('tasks', [])
-        }
-
-        rerun = self.rerun_ex_ref and task_specs
         if rerun:
-            result = self.rerun_workflow(ex_ref=self.rerun_ex_ref, task_specs=task_specs)
+            result = self.rerun_workflow(ex_ref=self.rerun_ex_ref, rerun_options=tasks)
         else:
             result = self.start_workflow(action_parameters=action_parameters)
 
@@ -141,37 +136,7 @@ class OrquestaRunner(runners.AsyncActionRunner):
 
         return (status, partial_results, ctx)
 
-    def _get_tasks(self, wf_ex_id, full_task_name, task_name, ac_ex_dbs):
-        task_exs = wf_db_access.TaskExecution.get_all(workflow_execution=wf_ex_id)
-
-        if '.' in task_name:
-            dot_pos = task_name.index('.')
-            parent_task_name = task_name[:dot_pos]
-            task_name = task_name[dot_pos + 1:]
-
-            parent_task_ids = [task.id for task in task_exs if task.name == parent_task_name]
-
-            workflow_ex_ids = [ac_ex.id for ac_ex in ac_ex_dbs
-                               if (getattr(ac_ex, 'task_execution_id', None) and
-                                   ac_ex.task_execution_id in parent_task_ids)]
-
-            tasks = {}
-
-            for sub_wf_ex_id in workflow_ex_ids:
-                tasks.update(self._get_tasks(sub_wf_ex_id, full_task_name, task_name, ac_ex_dbs))
-
-            return tasks
-
-        # pylint: disable=no-member
-        tasks = {
-            full_task_name: task.id
-            for task in task_exs
-            if task.task_name == task_name and task.status == ac_const.LIVEACTION_STATUS_FAILED
-        }
-
-        return tasks
-
-    def rerun_workflow(self, ex_ref, task_specs):
+    def rerun_workflow(self, ex_ref, rerun_options):
         wf_ex_id = ex_ref.context['workflow_execution']
 
         if not wf_ex_id:
@@ -180,34 +145,17 @@ class OrquestaRunner(runners.AsyncActionRunner):
         if ex_ref.status != ac_const.LIVEACTION_STATUS_FAILED:
             raise Exception('Workflow execution is not in a rerunable state.')
 
-        # Update children for newly create action execution
-        self.execution.children = ex_ref.children
-        ex_db_access.ActionExecution.add_or_update(self.execution, publish=False, validate=False)
-
-        ac_ex_dbs = ex_db_access.ActionExecution.get_all(workflow_execution=str(wf_ex_id))
-
-        tasks = {}
-        for task_name, task_spec in six.iteritems(task_specs):
-            tasks.update(self._get_tasks(wf_ex_id, task_name, task_name, ac_ex_dbs))
-
-        missing_tasks = list(set(task_specs.keys()) - set(tasks.keys()))
-        if missing_tasks:
-            raise Exception('Only tasks in error state can be rerun. Unable to identify '
-                            'rerunable tasks: %s. Please make sure that the task name is correct '
-                            'and the task is in rerunable state.' % ', '.join(missing_tasks))
-
         # Re-run workflow
+        wf_def = self.get_workflow_definition(self.entry_point)
         st2_ctx = self._construct_st2_context()
-        wf_ex_db = wf_svc.request_rerun(wf_ex_id, st2_ctx)
+        wf_ex_db = wf_svc.request_rerun(wf_ex_id, st2_ctx, wf_def, self.execution)
 
-        # Re-run task list.
-        if wf_ex_db.status == ac_const.LIVEACTION_STATUS_RERUNNING:
-            for task_name, task_id in six.iteritems(tasks):
-                wf_svc.rerun_task(task_id, st2_ctx, reset=task_specs[task_name].get('reset', False))
+        # Re-run tasks.
+        if wf_ex_db.status == ac_const.LIVEACTION_STATUS_REQUESTED:
+            wf_svc.rerun_task(wf_ex_db, st2_ctx, rerun_options)
 
-        # Handle re-run action execution completion.
-        # wf_svc.handle_action_execution_completion(self.execution)
-        if wf_ex_db.status in wf_statuses.COMPLETED_STATUSES:
+        wf_ex_db = wf_db_access.WorkflowExecution.get_by_id(wf_ex_id)
+        if wf_ex_db.status in ac_const.LIVEACTION_COMPLETED_STATES:
             status = wf_ex_db.status
             result = {'output': wf_ex_db.output or None}
 
@@ -218,7 +166,7 @@ class OrquestaRunner(runners.AsyncActionRunner):
                 msg = '[%s] Workflow execution completed with errors.'
                 LOG.error(msg, str(self.execution.id), extra=wf_ex_error)
 
-            return (status, result, self.context)
+            return status, result, self.context
 
     @staticmethod
     def task_pauseable(ac_ex):
